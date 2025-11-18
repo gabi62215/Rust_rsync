@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 walkdir = "2"
+adler = "1.0"
