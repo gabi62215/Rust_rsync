@@ -9,7 +9,7 @@
             "type" : "cppvsdbg",
             "request": "launch",
             "program": "${workspaceRoot}/target/debug/rsync.exe",
-            "args": ["C:\\Users\\NXF95789\\Desktop\\Licenta-main\\Licenta-main", "C:\\Users\\NXF95789\\Desktop\\Test_rsync"],
+            "args": ["C:\\rsync_test", "C:\\work\\sja1110-sdk-projects-develop@9f903776686\\switch_config_sja1110evm_minimal"],
             "cwd": "${workspaceRoot}"
         }
     ]

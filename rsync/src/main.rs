@@ -32,6 +32,11 @@ fn get_block_size(file_meta: &Metadata) -> usize {
     const MAX_BLOCK: usize = 256 * 1024;    // 256 KiB
     const TARGET_BLOCKS: u64 = 4000;        // midpoint of 2000–8000
 
+
+    if file_len < MIN_BLOCK as u64 {
+        return file_len as usize;
+    }
+
     // Compute ideal block size based on target number of blocks
     let ideal = (file_len / TARGET_BLOCKS) as usize;
 
@@ -53,13 +58,16 @@ enum DeltaOp {
 fn check_map(block_map: HashMap<u32, Vec<BlockEntry>>, src_path: &Path, block_size: usize) -> io::Result<Vec<DeltaOp>> {
     let file = fs::File::open(src_path)?;
     let mmap = unsafe { Mmap::map(&file)}?;
+    if mmap.len() < block_size {
+        return Ok(vec![DeltaOp::InsertData { data: mmap.to_vec() }]);
+    }
     let mut pos = 0;
     let mut src_block = &mmap[pos..pos + block_size];
     let mut operations: Vec<DeltaOp> = Vec::new();
     let mut rolling_checksum = Rolling::init(src_block);
     let mut byte_acc: Vec<u8> = Vec::new();
 
-'outer: while pos + block_size <= mmap.len() {
+'outer: while pos + block_size < mmap.len() {
         let weak = rolling_checksum.checksum();
 
         let block_matched = block_map.get(&weak);
@@ -77,7 +85,10 @@ fn check_map(block_map: HashMap<u32, Vec<BlockEntry>>, src_path: &Path, block_si
                     operations.push(DeltaOp::CopyBlock { index: block.index as u64});
 
                     pos += block_size;
-                    if pos + block_size > mmap.len() { break 'outer; }
+                    if pos + block_size > mmap.len() {
+                        byte_acc.extend_from_slice(&mmap[pos..mmap.len()]);
+                        break 'outer;
+                    }
 
                     src_block = &mmap[pos..pos + block_size];
                     rolling_checksum = Rolling::init(src_block);
@@ -94,7 +105,6 @@ fn check_map(block_map: HashMap<u32, Vec<BlockEntry>>, src_path: &Path, block_si
     if !byte_acc.is_empty() {
         operations.push(DeltaOp::InsertData { data: byte_acc });
     }
-
 
     Ok(operations)
 }
@@ -126,7 +136,6 @@ fn process_ops(ops: Vec<DeltaOp>, dst_path: &Path, block_size: usize, temp_path:
             }
         }
     }
-
 
     writer.flush()?; // flush BufWriter
     writer.get_ref().sync_all()?;
