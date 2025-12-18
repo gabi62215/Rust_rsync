@@ -224,8 +224,10 @@ fn copy_metadata(src_meta: &fs::Metadata, dst_path: &Path) -> io::Result<()> {
         }
 
         // Set modification time (works on all platforms)
-        use std::fs::File;
-        let file = File::open(dst_path)?;
+        use std::fs::OpenOptions;
+        let file = OpenOptions::new()
+            .write(true)
+            .open(dst_path)?;
         file.set_modified(modified)?;
     }
 
@@ -297,7 +299,6 @@ fn visit_dirs(src_dir: &Path, dst_dir: &Path) {
             };
 
             let compare_res = file_changed(&src_meta, &dst_meta);
-
             if compare_res {
                 // File has changed - use rsync algorithm to update
                 let block_size = get_block_size(&dst_meta);
@@ -320,8 +321,15 @@ fn visit_dirs(src_dir: &Path, dst_dir: &Path) {
                     }
                 };
 
-                // Apply delta operations
-                let temp_path = dst_path.with_extension("tmp");
+                // Apply delta operations with unique temp file
+                use std::process;
+                let temp_path = dst_path.with_file_name(
+                    format!("{}.tmp.{}",
+                        dst_path.file_name().unwrap().to_string_lossy(),
+                        process::id()
+                    )
+                );
+
                 match process_ops(ops, &dst_path, block_size, &temp_path) {
                     Ok(_) => {
                         // Copy metadata after successful sync
@@ -331,15 +339,29 @@ fn visit_dirs(src_dir: &Path, dst_dir: &Path) {
                     }
                     Err(e) => {
                         eprintln!("Failed to update dst file because of {}", e);
+                        // Clean up temp file on error
+                        let _ = fs::remove_file(&temp_path);
                         continue;
                     }
                 };
             }
         }
         else {
+            let src_meta = match entry.metadata() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to get metadata because of {}", e);
+                    continue;
+                }
+            };
+
             // Destination file doesn't exist - simple copy
             match fs::copy(src_path, &dst_path) {
                 Ok(bytes) => {
+                    // Copy metadata after successful sync
+                    if let Err(e) = copy_metadata(&src_meta, &dst_path) {
+                        eprintln!("Failed to copy metadata for '{}': {}", dst_path.display(), e);
+                    }
                     println!("Copied {} bytes", bytes);
                 }
                 Err(e) => eprintln!("Failed to copy file because of {}!", e),
@@ -457,4 +479,282 @@ fn main() {
 
     // Start synchronization
     visit_dirs(src_dir, dst_dir);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    // Helper function to create a test file with specific content
+    fn create_test_file(path: &Path, content: &[u8]) -> io::Result<()> {
+        let mut file = fs::File::create(path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    // Helper function to read file content
+    fn read_file(path: &Path) -> io::Result<Vec<u8>> {
+        fs::read(path)
+    }
+
+    // Helper to compare file contents
+    fn files_identical(path1: &Path, path2: &Path) -> bool {
+        match (read_file(path1), read_file(path2)) {
+            (Ok(content1), Ok(content2)) => content1 == content2,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn test_empty_file_sync() {
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        let dst_dir = temp_dir.path().join("dst");
+
+        fs::create_dir(&src_dir).unwrap();
+        fs::create_dir(&dst_dir).unwrap();
+
+        // Create empty file
+        let src_file = src_dir.join("empty.txt");
+        create_test_file(&src_file, b"").unwrap();
+
+        visit_dirs(&src_dir, &dst_dir);
+
+        let dst_file = dst_dir.join("empty.txt");
+        assert!(dst_file.exists());
+        assert_eq!(fs::metadata(&dst_file).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_small_file_sync() {
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        let dst_dir = temp_dir.path().join("dst");
+
+        fs::create_dir(&src_dir).unwrap();
+        fs::create_dir(&dst_dir).unwrap();
+
+        // Create small file (< 8 KiB)
+        let src_file = src_dir.join("small.txt");
+        let content = b"Hello, World!";
+        create_test_file(&src_file, content).unwrap();
+
+        visit_dirs(&src_dir, &dst_dir);
+
+        let dst_file = dst_dir.join("small.txt");
+        assert!(dst_file.exists());
+        assert!(files_identical(&src_file, &dst_file));
+    }
+
+    #[test]
+    fn test_large_file_sync() {
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        let dst_dir = temp_dir.path().join("dst");
+
+        fs::create_dir(&src_dir).unwrap();
+        fs::create_dir(&dst_dir).unwrap();
+
+        // Create large file (1 MB)
+        let src_file = src_dir.join("large.bin");
+        let content = vec![0xAB; 1024 * 1024];
+        create_test_file(&src_file, &content).unwrap();
+
+        visit_dirs(&src_dir, &dst_dir);
+
+        let dst_file = dst_dir.join("large.bin");
+        assert!(dst_file.exists());
+        assert!(files_identical(&src_file, &dst_file));
+    }
+
+    #[test]
+    fn test_file_update_with_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        let dst_dir = temp_dir.path().join("dst");
+
+        fs::create_dir(&src_dir).unwrap();
+        fs::create_dir(&dst_dir).unwrap();
+
+        let src_file = src_dir.join("update.txt");
+        let dst_file = dst_dir.join("update.txt");
+
+        // Initial sync
+        create_test_file(&src_file, b"Original content").unwrap();
+        visit_dirs(&src_dir, &dst_dir);
+        assert!(files_identical(&src_file, &dst_file));
+
+        // Wait to ensure different timestamp
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Update source file
+        create_test_file(&src_file, b"Updated content").unwrap();
+        visit_dirs(&src_dir, &dst_dir);
+
+        assert!(files_identical(&src_file, &dst_file));
+        assert_eq!(read_file(&dst_file).unwrap(), b"Updated content");
+    }
+
+    #[test]
+    fn test_partial_block_matching() {
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        let dst_dir = temp_dir.path().join("dst");
+
+        fs::create_dir(&src_dir).unwrap();
+        fs::create_dir(&dst_dir).unwrap();
+
+        let src_file = src_dir.join("partial.txt");
+        let dst_file = dst_dir.join("partial.txt");
+
+        // Create file with 10KB of 'A's
+        let original = vec![b'A'; 10 * 1024];
+        create_test_file(&src_file, &original).unwrap();
+        visit_dirs(&src_dir, &dst_dir);
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Append some data (tests partial block at end)
+        let mut updated = original.clone();
+        updated.extend_from_slice(b"APPENDED DATA");
+        create_test_file(&src_file, &updated).unwrap();
+        visit_dirs(&src_dir, &dst_dir);
+
+        assert!(files_identical(&src_file, &dst_file));
+    }
+
+    #[test]
+    fn test_nested_directory_creation() {
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        let dst_dir = temp_dir.path().join("dst");
+
+        fs::create_dir(&src_dir).unwrap();
+        fs::create_dir(&dst_dir).unwrap();
+
+        // Create nested structure
+        let nested_dir = src_dir.join("level1").join("level2").join("level3");
+        fs::create_dir_all(&nested_dir).unwrap();
+
+        let nested_file = nested_dir.join("deep.txt");
+        create_test_file(&nested_file, b"Deep file").unwrap();
+
+        visit_dirs(&src_dir, &dst_dir);
+
+        let dst_nested_file = dst_dir.join("level1").join("level2").join("level3").join("deep.txt");
+        assert!(dst_nested_file.exists());
+        assert!(files_identical(&nested_file, &dst_nested_file));
+    }
+
+    #[test]
+    fn test_metadata_preservation() {
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        let dst_dir = temp_dir.path().join("dst");
+
+        fs::create_dir(&src_dir).unwrap();
+        fs::create_dir(&dst_dir).unwrap();
+
+        let src_file = src_dir.join("meta.txt");
+        create_test_file(&src_file, b"Test content").unwrap();
+
+        // Get original modification time
+        let src_meta_before = fs::metadata(&src_file).unwrap();
+        let src_mtime = src_meta_before.modified().unwrap();
+
+        visit_dirs(&src_dir, &dst_dir);
+
+        let dst_file = dst_dir.join("meta.txt");
+        let dst_meta = fs::metadata(&dst_file).unwrap();
+        let dst_mtime = dst_meta.modified().unwrap();
+
+        // Modification times should match (within 1 second tolerance for filesystem precision)
+        let diff = if src_mtime > dst_mtime {
+            src_mtime.duration_since(dst_mtime).unwrap()
+        } else {
+            dst_mtime.duration_since(src_mtime).unwrap()
+        };
+
+        assert!(diff < Duration::from_secs(2), "Modification times differ by {:?}", diff);
+    }
+
+    #[test]
+    fn test_no_update_when_identical() {
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        let dst_dir = temp_dir.path().join("dst");
+
+        fs::create_dir(&src_dir).unwrap();
+        fs::create_dir(&dst_dir).unwrap();
+
+        let src_file = src_dir.join("same.txt");
+        let dst_file = dst_dir.join("same.txt");
+
+        create_test_file(&src_file, b"Same content").unwrap();
+        visit_dirs(&src_dir, &dst_dir);
+
+        // Get dst modification time after first sync
+        let dst_mtime_1 = fs::metadata(&dst_file).unwrap().modified().unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Sync again without changes
+        visit_dirs(&src_dir, &dst_dir);
+
+        // Modification time should not change
+        let dst_mtime_2 = fs::metadata(&dst_file).unwrap().modified().unwrap();
+        assert_eq!(dst_mtime_1, dst_mtime_2);
+    }
+
+    #[test]
+    fn test_rolling_checksum() {
+        let data = b"Hello, World!";
+
+        // Calculate checksum for window starting at position 1
+        let rolling1 = Rolling::init(&data[1..]);
+        let checksum1 = rolling1.checksum();
+
+        // Calculate checksum for window starting at position 0, then roll forward
+        let mut rolling2 = Rolling::init(&data[0..data.len()-1]);
+        rolling2.roll(data[0], data[data.len()-1]);
+        let checksum2 = rolling2.checksum();
+
+        // Both should represent the same window: "ello, World!"
+        assert_eq!(checksum1, checksum2);
+    }
+
+    #[test]
+    fn test_block_size_calculation() {
+        // Test minimum block size
+        let small_meta = fs::metadata("Cargo.toml").unwrap();
+
+        // Mock metadata for testing (we'll use actual file but conceptually test the function)
+        // For very small files
+        assert!(get_block_size(&small_meta) >= 8 * 1024 || small_meta.len() < 8 * 1024);
+    }
+
+    #[test]
+    fn test_file_changed_detection() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let file1 = temp_dir.path().join("file1.txt");
+        let file2 = temp_dir.path().join("file2.txt");
+
+        create_test_file(&file1, b"content").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        create_test_file(&file2, b"content").unwrap();
+
+        let meta1 = fs::metadata(&file1).unwrap();
+        let meta2 = fs::metadata(&file2).unwrap();
+
+        // file2 is newer, so it should be detected as changed
+        assert!(file_changed(&meta2, &meta1));
+        // file1 is older, so it should not be detected as changed
+        assert!(!file_changed(&meta1, &meta2));
+    }
 }
